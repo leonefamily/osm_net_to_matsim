@@ -949,7 +949,7 @@ def fix_geometry(
 
 def get_lanes_number(
         lnum_str: Optional[str]
-) -> float:
+) -> Optional[float]:
     """
     Parse string lane count safely, or return None, if couldn't parse.
 
@@ -960,18 +960,17 @@ def get_lanes_number(
 
     Returns
     -------
-    float
+    Optional[float]
 
     """
     if lnum_str is None:
-        return None
+        return
     elif lnum_str.isdigit():
         return float(lnum_str)
     else:
         digits = re.findall(r'\d+', lnum_str)
         if digits:
             return float(digits[0])
-    return None
 
 
 def get_link_id(
@@ -1205,16 +1204,7 @@ def main(
 
 
 if __name__ == '__main__':
-    # args = parse_args()
-    args = parse_args([
-        '-p', '/home/leonefamily/disser_model/source_data/brno.osm.pbf',
-        '-c', 'epsg:5514',
-        '-o', '/home/leonefamily/disser_model/source_data/bmo.shp',
-        '-d', '/home/leonefamily/disser_model/source_data/brno.shp',
-        '-n', '/home/leonefamily/disser_model/processed_source_data/net.xml',
-        '-e', '/home/leonefamily/disser_model/processed_source_data/edges.shp',
-        '-N', '/home/leonefamily/disser_model/processed_source_data/nodes.shp',
-    ])
+    args = parse_args()
     main(
         pbf_path=args.pbf_path,
         crs=args.crs,
