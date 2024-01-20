@@ -20,7 +20,7 @@ import networkx as nx
 import geopandas as gpd
 from pathlib import Path
 from shapely.ops import split
-from typing import Union, Optional, Dict, List, Tuple
+from typing import Union, Optional, Dict, List, Tuple, Any, Set
 from shapely.geometry import (
     LineString, MultiLineString, Point, MultiPoint, Polygon
 )
@@ -86,6 +86,11 @@ DEFAULT_RAIL_CAPACITY = 60  # 1 consist a minute
 
 TO_CRS = 'epsg:5514'
 
+EdgeWithData = Tuple[Tuple[float, float], Tuple[float, float], int, Dict[str, Any]]
+NodeWithData = Tuple[Tuple[float, float], Dict[str, Any]]
+Edge = Tuple[Tuple[float, float], Tuple[float, float], int]
+ForbiddenTurns = AllowedTurns = Set[Tuple[Edge, Edge]]
+
 
 def parse_args(
         args_list: Optional[List[str]] = None
@@ -140,8 +145,9 @@ def get_road_net(
         osm: pyrosm.pyrosm.OSM,
         crs: str,
         higher_detail_poly: Optional[Polygon] = None,
-        outer_border_poly: Optional[Polygon] = None
-) -> nx.MultiDiGraph:
+        outer_border_poly: Optional[Polygon] = None,
+        extract_lane_definitions: bool = True
+) -> Tuple[nx.MultiDiGraph, Optional[ForbiddenTurns]]:
     """
     Extract road network from OSM and turn it into a cleaned directed graph.
 
@@ -189,7 +195,7 @@ def get_road_net(
             'service': ['parking', 'parking_aisle', 'private', 'emergency_access']
         },
         osm_keys_to_keep=['highway'],
-        extra_attributes=['railway', 'maxspeed', 'lanes', 'smoothness', 'osmid'],
+        extra_attributes=['railway', 'maxspeed', 'lanes', 'smoothness', 'roundabout'],
         filter_type='exclude',
         keep_nodes=False,
         keep_relations=False
@@ -212,8 +218,12 @@ def get_road_net(
 
     road_net = fix_geometry(road_net)
     tags_to_dict(road_net)
+    road_net.loc[
+        road_net['junction'].isin({'roundabout', 'mini_roundabout'}),
+        'oneway'
+    ] = 'yes'
 
-    rev_road_net = road_net[road_net['oneway'] != 'yes'].copy()
+    rev_road_net = road_net[(road_net['oneway'] != 'yes')].copy()
     rev_road_net['geometry'] = rev_road_net['geometry'].apply(
         lambda x: LineString(list(x.coords)[::-1])
     )
@@ -230,14 +240,23 @@ def get_road_net(
             'services', 'raceway', 'bus_stop', 'toll_gantry', 'via_ferrata',
             'crossing'
         ])
-        ]
+    ]
     road_net['lanes'] = road_net['lanes'].apply(get_lanes_number)
-    road_net['maxspeed'] = road_net['maxspeed'].apply(convert_maxspeed_to_float)
+    road_net['maxspeed'] = road_net['maxspeed'].apply(
+        convert_maxspeed_to_float
+    )
     guess_road_parameters(road_net)
 
     graph = momepy.gdf_to_nx(road_net, directed=True)
     delete_islands_dir(graph)
-    return graph
+
+    if extract_lane_definitions:
+        forbidden_turns = get_all_forbidden_turns(osm, graph)
+        graph, turnsgraph = check_restrictions_integrity(graph, forbidden_turns)
+    else:
+        forbidden_turns = None
+
+    return graph, forbidden_turns
 
 
 def get_tram_net(
@@ -826,13 +845,6 @@ def write_network(
         attrs = graph.edges[edge]
         fr = graph.nodes[from_node]['nodenum']
         to = graph.nodes[to_node]['nodenum']
-        lid = get_link_id(
-            modes=attrs['modes'],
-            from_node=fr,
-            to_node=to,
-            osmid=attrs['id']
-        )
-        attrs['link_id'] = lid
         attrs['freespeed'] = get_freespeed(attrs['maxspeed'])
         try:
             attrs['permlanes'] = attrs['lanes']
@@ -843,7 +855,7 @@ def write_network(
             fr=fr,
             to=to,
             attrs=attrs,
-            add_attrs=('geometry',)
+            add_attrs=('geometry','osm_id')
         )
 
     bigstring += '</links>\n'
@@ -977,7 +989,7 @@ def get_link_id(
         modes: str,
         from_node: int,
         to_node: int,
-        osmid: int
+        id: int
 ) -> str:
     """
     Combine
@@ -990,8 +1002,8 @@ def get_link_id(
         Origin node number.
     to_node : int
         Destination node number.
-    osmid : int
-        OSM way ID.
+    id : int
+        OSM way ID or other identifier.
 
     Returns
     -------
@@ -1002,8 +1014,34 @@ def get_link_id(
     is_pt = any(m in ['pt', 'tram', 'metro', 'rail'] for m in modes_list)
     is_road = any(m in ['car', 'truck'] for m in modes_list)
     if is_pt and not is_road:
-        return f'pt_{from_node}_{to_node}_{osmid}'
-    return f'{from_node}_{to_node}_{osmid}'
+        return f'pt_{from_node}_{to_node}_{id}'
+    return f'{from_node}_{to_node}_{id}'
+
+
+def assign_link_ids(
+        graph: nx.MultiDiGraph
+):
+    """
+    Create the `link_id` attribute and assign a unique value to it.
+
+    IDs are created based on `nodenum` attribute of nodes and `num` attribute
+    of edges in the graph (must be assigned prior to running this function).
+    Changes are made in place.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        OSM network graph.
+
+    """
+    enumerate_edges(graph)
+    for fnode, tnode, ekey, edata in graph.edges(keys=True, data=True):
+        edata['link_id'] = get_link_id(
+            modes=edata['modes'],
+            from_node=graph.nodes[fnode]['nodenum'],
+            to_node=graph.nodes[tnode]['nodenum'],
+            id=edata['num']
+        )
 
 
 def get_freespeed(
@@ -1028,19 +1066,351 @@ def get_freespeed(
     return max(1.0, round(speed / 3.6, roundto))
 
 
-def get_lane_definitions(
+def find_edges_by_id(
+        id: int,
+        graph: nx.MultiDiGraph,
+        id_attr: str = 'id'
+) -> List[EdgeWithData]:
+    """
+    Find all graph edges containing the ``id`` value in ``id_attr`` attribute.
+
+    Parameters
+    ----------
+    id : int
+        Edge attribute value.
+    graph : nx.MultiDiGraph
+        OSM network graph.
+    id_attr : str, optional
+        Attribute's name to look for. The default is 'id'.
+
+    Returns
+    -------
+    List[EdgeWithData]
+        A list of edges with matching attributes values.
+
+    """
+    edges = []
+    for e in graph.edges(data=True, keys=True):
+        if e[-1][id_attr] == id:
+            edges.append(e)
+    return edges
+
+
+def find_common_node_and_edges(
+        fromid: int,
+        toid: int,
+        graph: nx.MultiDiGraph,
+        id_attr: str = 'id'
+) -> Optional[Tuple[NodeWithData, EdgeWithData, EdgeWithData]]:
+    """
+    Search for edges with provided attributes and their common node.
+
+    None is returned, when there are no edges with the requested parameters
+    or they do not have a common node.
+
+    Parameters
+    ----------
+    fromid : int
+        Start edge's attribute.
+    toid : int
+        End edge's attribute.
+    graph : nx.MultiDiGraph
+        OSM network graph.
+    id_attr : str, optional
+        Attribute's name to look for. The default is 'id'.
+
+    Returns
+    -------
+    Optional[Tuple[NodeWithData, EdgeWithData, EdgeWithData]]
+        None if the requirements are not met in the graph.
+
+    """
+    ies = find_edges_by_id(fromid, graph, id_attr=id_attr)
+    oes = find_edges_by_id(toid, graph, id_attr=id_attr)
+    if not ies or not oes:
+        return
+
+    for ie in ies:
+        for oe in oes:
+            if ie[1] == oe[0]:
+                n_attrs = graph.nodes[oe[0]]
+                return (oe[0], n_attrs), ie, oe
+
+
+def get_forbidden_turns(
         osm: pyrosm.pyrosm.OSM,
         graph: nx.MultiDiGraph
-) -> str:
-    if True:
-        return
-    get_restrictions(osm=osm)
+) -> ForbiddenTurns:
+    """
+    Extract forbidden turns from the OSM format.
+
+    Will only work, if the ``osm`` object was parsed at least once.
+
+    Parameters
+    ----------
+    osm : pyrosm.pyrosm.OSM
+        OSM object of pyrosm module with a linked PBF file.
+    graph : nx.MultiDiGraph
+        OSM network graph.
+
+    Returns
+    -------
+    ForbiddenTurns
+
+    """
+    restrictions = get_restrictions(osm=osm)
+    forbidden_turns = set()
+    to_skip = set()
+
+    for i, restriction in restrictions.iterrows():
+        fromid, toid, rtype = restriction[
+            ['from', 'to', 'restriction_type']
+        ].tolist()
+        n_ie_oe = find_common_node_and_edges(fromid, toid, graph)
+        if n_ie_oe is None:
+            continue
+        n, ie, oe = n_ie_oe
+        if rtype == 'prohibitory':
+            forbidden_turns.add((ie[:-1], oe[:-1]))
+        elif rtype == 'mandatory':
+            if fromid in to_skip:
+                continue
+            other_restrictions = restrictions[
+                (restrictions['from'] == ie[-1]['id']) &
+                (restrictions['restriction_type'] == 'mandatory')
+            ]
+            other_restrictions_targets = set(
+                other_restrictions['to'].tolist()
+            )
+            forbidden_edges = [
+                foe for foe in graph.out_edges(ie[:-1], data=True, keys=True)
+                if foe[0] == ie[1]
+                and foe[-1]['id'] not in other_restrictions_targets
+            ]
+            for foe in forbidden_edges:
+                forbidden_turns.add((ie[:-1], foe[:-1]))
+            to_skip.add(fromid)
+    return forbidden_turns
+
+
+def enumerate_edges(
+        graph: nx.MultiDiGraph,
+        attr: str = 'num',
+        start: int = 0
+):
+    """
+    Assign ``attr`` attribute to each edge graph with regard to their location.
+
+    For one-way edges a unique number is assigned, whereas bidirectional edges
+    (with the same set of start and end nodes) get duplicated numbers.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        OSM network graph.
+    attr : str, optional
+        A name of attribute on each edge. The default is 'num'.
+    start : int, optional
+        The smallest number that edges will have. The default is 0.
+
+    """
+    to_skip = set()
+    for i, e_key_data in enumerate(graph.edges(data=True, keys=True), start=start):
+        fn, tn, ekey, edata = e_key_data
+        if (fn, tn, ekey) in to_skip:
+            continue
+        oes = [
+            (ofn, otn, oekey, oedata) for ofn, otn, oekey, oedata in
+            graph.out_edges(tn, data=True, keys=True) if otn == fn and ofn == tn
+        ]
+        for ofn, otn, oekey, oedata in oes:
+            oedata[attr] = i
+            to_skip.add((ofn, otn, oekey))
+        edata[attr] = i
+
+
+def get_forbidden_uturns(
+        graph: nx.MultiDiGraph,
+        forbidden_turns: ForbiddenTurns
+) -> ForbiddenTurns:
+    """
+    Create u-turns restrictions.
+
+    A node with 2 out an 2 in edges with the same set of start and end nodes
+    are considered u-turn.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        OSM network graph.
+    forbidden_turns : ForbiddenTurns
+        Restricted movemens between edges.
+
+    Returns
+    -------
+    ForbiddenTurns
+
+    """
+    forbidden_uturns = set()
+    enumerate_edges(graph)
+    for n in graph.nodes:
+        oes = list(graph.out_edges(n, keys=True, data=True))  # out edges
+        ies = list(graph.in_edges(n, keys=True, data=True))  # in edges
+
+        # interested in roads that are bidirectional and are not dead ends
+        if len(oes) == 2 and len(ies) == 2:
+            out_ids = {oe[-1]['num'] for oe in oes}
+            in_ids = {ie[-1]['num'] for ie in ies}
+            common = in_ids.intersection(out_ids)
+            if common == out_ids:
+                for ie in ies:
+                    # if ie[:-1] in forbidden_turns:
+                    #     continue
+                    oe = [oe for oe in oes if ie[0] == oe[1]][0]
+                    forbidden_uturns.add((ie[:-1], oe[:-1]))
+    return forbidden_uturns
+
+
+def get_all_forbidden_turns(
+        osm: pyrosm.pyrosm.OSM,
+        graph: nx.MultiDiGraph
+) -> ForbiddenTurns:
+    """
+    Extract OSM turn restrictions and turn them into a set of edges pairs.
+
+    Also adds u-turns restrictions.
+
+    Parameters
+    ----------
+    osm : pyrosm.pyrosm.OSM
+        OSM object of pyrosm module with a linked PBF file.
+    graph : nx.MultiDiGraph
+        OSM network graph.
+
+    Returns
+    -------
+    ForbiddenTurns
+        Restricted movemens between edges.
+
+    """
+    forbidden_turns = get_forbidden_turns(osm, graph)
+    forbidden_uturns = get_forbidden_uturns(graph, forbidden_turns)
+    all_forbidden_turns = forbidden_turns.union(forbidden_uturns)
+    return all_forbidden_turns
+
+
+def check_restrictions_integrity(
+        graph: nx.MultiDiGraph,
+        forbidden_turns: ForbiddenTurns
+) -> Tuple[nx.MultiDiGraph, nx.MultiDiGraph]:
+    """
+    Check all turn restrictions and drop edges that are not accessible.
+
+    This happens by converting a directed street network graph into a
+    line graph that represents existing edges as nodes and connections
+    between them (turns) as edges. Knowing the restrictions, forbidden
+    turns are removed from the line graph, so the nodes (former edges),
+    that are not accessible from at least one direction are dropped as well.
+    A refined copy of initial graph is returned afterwards.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        OSM network graph.
+    forbidden_turns : ForbiddenTurns
+        Restricted movemens between edges.
+
+    Returns
+    -------
+    Tuple[nx.MultiDiGraph, nx.MultiDiGraph]
+        A network graph cleaned according to forbidden turns.
+        A graph of all possible turns within the network graph.
+
+    """
+    linegraph = nx.line_graph(graph)
+    remove_turns = set()
+
+    for e_ekey in linegraph.edges(keys=True):
+        e = e_ekey[:2]
+        if e in forbidden_turns:
+            remove_turns.add(e_ekey)
+        else:
+            # only for linegraph, not essential, can be removed
+            origeattrs1 = graph.edges[e[0][0], e[0][1], e[0][2]]
+            try:
+                opposattrs1 = graph.edges[e[0][1], e[0][0], e[0][2]]
+            except:
+                opposattrs1 = {'id': 'None'}
+            orige1 = origeattrs1['geometry']
+            origeattrs2 = graph.edges[e[1][0], e[1][1], e[1][2]]
+            try:
+                opposattrs2 = graph.edges[e[1][1], e[1][0], e[0][2]]
+            except:
+                opposattrs2 = {'id': 'None'}
+            orige2 = origeattrs2['geometry']
+            nodegeom1 = orige1.interpolate(orige1.length / 2)
+            nodegeom2 = orige2.interpolate(orige2.length / 2)
+            nx.set_edge_attributes(
+                linegraph, {
+                    e_ekey: {
+                        'geometry': LineString([nodegeom1, nodegeom2]),
+                        'edgename': str(e_ekey),
+                        'id1': origeattrs1['id'],
+                        'id2': origeattrs2['id'],
+                    }
+                }
+            )
+            nodeattrs1 = linegraph.nodes[e[0]]
+            nodeattrs2 = linegraph.nodes[e[1]]
+            if 'geometry' not in nodeattrs1:
+                nodeattrs1['id'] = origeattrs1['id']
+                nodeattrs1['id_opp'] = opposattrs1['id']
+                nodeattrs1['geometry'] = nodegeom1
+            if 'geometry' not in nodeattrs2:
+                nodeattrs2['geometry'] = nodegeom2
+                nodeattrs2['id'] = origeattrs2['id']
+                nodeattrs2['id_opp'] = opposattrs2['id']
+
+    for rfrom, rto, rkey in remove_turns:
+        linegraph.remove_edge(rfrom, rto, key=rkey)
+
+    cmps = list(nx.strongly_connected_components(linegraph))
+    max_cmp_idx = cmps.index(max(cmps, key=len))
+    linegraph = linegraph.subgraph(cmps.pop(max_cmp_idx))
+
+    newgraph = graph.copy()
+    for e_ekey in itertools.chain.from_iterable(cmps):
+        newgraph.remove_edge(*e_ekey)
+
+    new_linegraph = linegraph.copy()
+    linenodes_mapping = {}
+    for n, ndata in new_linegraph.nodes(data=True):
+        ipt = ndata['geometry']
+        linenodes_mapping[n] = ipt.x, ipt.y
+    turnsgraph = nx.relabel_nodes(new_linegraph, linenodes_mapping)
+    return newgraph, turnsgraph
 
 
 def get_members(
         members_raw: Dict[str, np.ndarray],
         as_json_string: bool = False
 ) -> Union[str, List[Dict[str, Union[int, str]]]]:
+    """
+    Process members of relations from raw data.
+
+    Parameters
+    ----------
+    members_raw : Dict[str, np.ndarray]
+        Raw members dictionary from ``pyrosm`` module.
+    as_json_string : bool, optional
+        Whether to return as JSON string rather than list of objects.
+        The default is False.
+
+    Returns
+    -------
+    Union[str, List[Dict[str, Union[int, str]]]]
+
+    """
     members = []
     for n, member_id in enumerate(members_raw['member_id']):
         members.append({
@@ -1105,6 +1475,48 @@ def get_restrictions(
     return restrictions
 
 
+def rebuild_forbidden_turns(
+        graph: nx.MultiDiGraph,
+        forbidden_turns: ForbiddenTurns
+) -> ForbiddenTurns:
+    """
+    Recreate forbidden turns for a graph with removed links or nodes.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        DESCRIPTION.
+    forbidden_turns : ForbiddenTurns
+        DESCRIPTION.
+
+    Returns
+    -------
+    ForbiddenTurns
+        DESCRIPTION.
+
+    """
+    new_forbidden_turns = set()
+    for ie, oe in forbidden_turns:
+        try:
+            # find the same edges pair on new graph
+            in_edges = [
+                e for e in graph.in_edges(ie[1], keys=True, data=True)
+                if e[:2] == ie[:2]
+            ]
+            out_edges = [
+                e for e in graph.out_edges(oe[0], keys=True, data=True)
+                if e[:2] == oe[:2]
+            ]
+            if not in_edges or not out_edges:
+                continue
+            for iedge in in_edges:
+                for oedge in out_edges:
+                    new_forbidden_turns.add((iedge[:-1], oedge[:-1]))
+        except (KeyError, IndexError):  # skip if there are no nodes or edges
+            continue
+    return new_forbidden_turns
+
+
 def write_shps(
         graph: nx.MultiDiGraph,
         edges_save_path: Union[str, Path],
@@ -1126,6 +1538,106 @@ def write_shps(
     nodes, edges = momepy.nx_to_gdf(graph, points=True, lines=True)
     edges.dropna(how='all', axis=1).to_file(edges_save_path, encoding='utf-8')
     nodes.dropna(how='all', axis=1).to_file(nodes_save_path, encoding='utf-8')
+
+
+def get_allowed_turns(
+        graph: nx.MultiDiGraph,
+        forbidden_turns: ForbiddenTurns
+) -> AllowedTurns:
+    """
+    Create allowed turns set based on forbidden ones.
+
+    Only turns from affected links are added. Links that don't have any
+    restrictions imposed are omitted.
+
+    Parameters
+    ----------
+    graph : nx.MultiDiGraph
+        DESCRIPTION.
+    forbidden_turns : ForbiddenTurns
+        DESCRIPTION.
+
+    Returns
+    -------
+    AllowedTurns
+
+    """
+    allowed_turns = set()
+    to_skip = set()
+    for fie, foe in forbidden_turns:
+        if fie in to_skip:
+            continue
+        edge_forbidden_targets = {
+            oe for ie, oe in forbidden_turns if fie == ie
+        }
+        for aoe in graph.out_edges(fie[1], keys=True):
+            if aoe not in edge_forbidden_targets:
+                allowed_turns.add((fie, aoe))
+        to_skip.add(fie)
+    return allowed_turns
+
+
+def _ws(
+        num: int
+) -> str:
+    """Get ``num`` whitespaces multiplied by 4"""
+    return ' ' * num * 4
+
+
+def get_lane_definitions(
+        graph: nx.MultiDiGraph,
+        allowed_turns: AllowedTurns
+) -> str:
+    ld = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    ld += (
+        '<laneDefinitions xsi:schemaLocation='
+        '"http://www.matsim.org/files/dtd '
+        'http://www.matsim.org/files/dtd/laneDefinitions_v2.0.xsd" '
+        'xmlns="http://www.matsim.org/files/dtd" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+        )
+    to_skip = set()
+    for aie, _ in allowed_turns:
+        if aie in to_skip:
+            continue
+        ilink_id = graph.edges[aie]['link_id']
+        edge_allowed_targets = {
+            oe for ie, oe in allowed_turns if aie == ie
+        }
+        idata = graph.edges[aie]
+        fromlink = idata["link_id"]
+        fromlength = idata['mm_len']
+        ld += f'{_ws(1)}<lanesToLinkAssignment linkIdRef="{fromlink}">\n'
+        lanecount = int(idata['lanes'])
+        base_capacity = round(idata["capacity"] / lanecount)
+        for lane in range(lanecount):
+            fromlaneref = f'{fromlink}.{lane}'
+            represented_lanes = 1  # for future
+            lane_capacity = round(base_capacity * represented_lanes)
+            ld += f'{_ws(2)}<lane id="{fromlaneref}">\n'
+            ld += f'{_ws(3)}<leadsTo>\n'
+            for aoe in edge_allowed_targets:
+                odata = graph.edges[aoe]
+                tolink = odata['link_id']
+                ld += f'{_ws(4)}<toLink refId="{tolink}"/>\n'
+            ld += f'{_ws(3)}</leadsTo>\n'
+            ld += f'{_ws(3)}<representedLanes number="1"/>\n'
+            ld += f'{_ws(3)}<capacity vehiclesPerHour="{lane_capacity}"/>\n'
+            ld += f'{_ws(3)}<startsAt meterFromLinkEnd="{fromlength}"/>\n'
+            ld += f'{_ws(3)}<alignment>{lane + 1}</alignment>\n'
+            ld += f'{_ws(2)}</lane>\n'
+        ld += f'{_ws(1)}</lanesToLinkAssignment>\n'
+        to_skip.add(aie)
+    ld += '</laneDefinitions>'
+    return ld
+
+
+def write_lane_definitions(
+        ld: str,
+        outpath: Union[str, Path]
+):
+    with open(outpath, mode='w', encoding='utf-8') as f:
+        f.write(ld)
 
 
 def main(
@@ -1172,11 +1684,12 @@ def main(
     else:
         outer_border_poly = None
 
-    road_graph = get_road_net(
+    road_graph, forbidden_turns = get_road_net(
         osm=osm,
         crs=crs,
         higher_detail_poly=higher_detail_poly,
-        outer_border_poly=outer_border_poly
+        outer_border_poly=outer_border_poly,
+        extract_lane_definitions=lane_definitions_save_path is not None
     )
     rail_graph = get_rail_net(
         osm=osm,
@@ -1196,8 +1709,16 @@ def main(
     graph = nx.compose_all(
         [road_graph, rail_graph, tram_graph, metro_graph]
     )
-    # !!! include restrictions
     assign_nodenums(graph)
+    assign_link_ids(graph)
+    if lane_definitions_save_path is not None:
+        forbidden_turns = rebuild_forbidden_turns(
+            graph=graph,
+            forbidden_turns=forbidden_turns
+        )
+        allowed_turns = get_allowed_turns(graph, forbidden_turns)
+        lane_definitions = get_lane_definitions(graph, allowed_turns)
+        write_lane_definitions(lane_definitions, lane_definitions_save_path)
     write_network(graph, network_save_path)
     if edges_save_path is not None and nodes_save_path is not None:
         write_shps(graph, edges_save_path, nodes_save_path)
@@ -1212,5 +1733,6 @@ if __name__ == '__main__':
         higher_detail_poly_path=args.higher_detail_poly_path,
         network_save_path=args.network_save_path,
         edges_save_path=args.edges_save_path,
-        nodes_save_path=args.nodes_save_path
+        nodes_save_path=args.nodes_save_path,
+        lane_definitions_save_path=args.lane_definitions_save_path
     )
