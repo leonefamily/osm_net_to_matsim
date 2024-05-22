@@ -19,8 +19,9 @@ import pandas as pd
 import networkx as nx
 import geopandas as gpd
 from pathlib import Path
-from shapely.ops import split
-from typing import Union, Optional, Dict, List, Tuple, Any, Set
+from collections import defaultdict
+from shapely.ops import split, unary_union
+from typing import Union, Optional, Dict, List, Tuple, Any, Set, Literal
 from shapely.geometry import (
     LineString, MultiLineString, Point, MultiPoint, Polygon
 )
@@ -146,7 +147,8 @@ def get_road_net(
         crs: str,
         higher_detail_poly: Optional[Polygon] = None,
         outer_border_poly: Optional[Polygon] = None,
-        extract_lane_definitions: bool = True
+        extract_lane_definitions: bool = True,
+        split_at_stops: bool = True
 ) -> Tuple[nx.MultiDiGraph, Optional[ForbiddenTurns]]:
     """
     Extract road network from OSM and turn it into a cleaned directed graph.
@@ -157,10 +159,15 @@ def get_road_net(
         OSM object of pyrosm module with a linked PBF file.
     crs: str
         Name of coordinate reference system.
-    higher_detail_poly : Optional[gpd.GeoDataFrame], optional
+    higher_detail_poly : Optional[Polygon], optional
         Polygon to keep high detail of roads in. The default is None.
-    outer_border_poly : Optional[gpd.GeoDataFrame], optional
+    outer_border_poly : Optional[Polygon], optional
         Polygon to crop net with. The default is None.
+    extract_lane_definitions : bool, optional
+        Whether to apply basic turn restrictions from OSM. The default is True.
+    split_at_stops : Optional[bool], optional
+        Split links at the locations of tram stops. The default is False.
+        Turns out, this feature doesn't work much on the road network
 
     Raises
     ------
@@ -218,6 +225,15 @@ def get_road_net(
 
     road_net = fix_geometry(road_net)
     tags_to_dict(road_net)
+
+    if split_at_stops:
+        road_net = split_links_by_nearest_stops(
+            osm=osm,
+            net_gdf=road_net,
+            outer_border_poly=outer_border_poly,
+            mode='bus'
+        )
+
     road_net.loc[
         road_net['junction'].isin({'roundabout', 'mini_roundabout'}),
         'oneway'
@@ -248,7 +264,7 @@ def get_road_net(
     guess_road_parameters(road_net)
 
     graph = momepy.gdf_to_nx(road_net, directed=True)
-    delete_islands_dir(graph)
+    delete_islands(graph)
 
     if extract_lane_definitions:
         forbidden_turns = get_all_forbidden_turns(osm, graph)
@@ -259,10 +275,142 @@ def get_road_net(
     return graph, forbidden_turns
 
 
+def get_stops_geoms(
+        osm: pyrosm.pyrosm.OSM,
+        crs: str,
+        outer_border_poly: Optional[Polygon] = None,
+        mode: Literal['tram', 'bus', 'rail'] = 'bus'
+) -> gpd.GeoDataFrame:
+    """
+    Get stops of the selected mode as nodes.
+
+    Parameters
+    ----------
+    osm : pyrosm.pyrosm.OSM
+        OSM object of pyrosm module with a linked PBF file.
+    crs: str
+        Name of coordinate reference system.
+    outer_border_poly : Optional[Polygon], optional
+        Only include stops within this polygon. The default is None.
+    mode : Literal['tram', 'bus', 'rail'], optional
+        Stops for which mode. The default is 'bus'.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+
+    """
+    if mode == 'tram':
+        stops_geoms = osm.get_data_by_custom_criteria(
+            custom_filter={
+                'railway': ['tram_stop']
+            }
+        )
+    elif mode == 'bus':
+        stops_geoms = osm.get_data_by_custom_criteria(
+            custom_filter={
+                'highway': ['bus_stop']
+            }
+        )
+    elif mode == 'rail':
+        stops_geoms = osm.get_data_by_custom_criteria(
+            custom_filter={
+                'railway': ['stop']
+            },
+            extra_attributes=['tram']
+        )
+        stops_geoms.drop(
+            stops_geoms[stops_geoms['tram'] == 'yes'].index,
+            inplace=True
+        )
+    else:
+        raise RuntimeError(f'Unsupported mode "{mode}"')
+    stops_geoms = stops_geoms.to_crs(crs)
+    stops_geoms.geometry = stops_geoms.centroid
+    if outer_border_poly is not None:
+        stops_geoms.drop(
+            stops_geoms[
+                ~stops_geoms.within(outer_border_poly)
+            ].index,
+            inplace=True
+        )
+    return stops_geoms
+
+
+def split_links_by_nearest_stops(
+        osm: pyrosm.pyrosm.OSM,
+        net_gdf: gpd.GeoDataFrame,
+        outer_border_poly:  Optional[Polygon] = None,
+        tolerance: Union[int, float] = 10,  # meters
+        mode: Literal['tram', 'bus', 'rail'] = 'tram'
+) -> gpd.GeoDataFrame:
+    """
+    Split links by provided stops geometries.
+
+    Snap stops that are up to ``tolerance`` meters to links and split.
+
+    Parameters
+    ----------
+    osm : pyrosm.pyrosm.OSM
+        OSM object of pyrosm module with a linked PBF file.
+    net_gdf : gpd.GeoDataFrame
+        Network GeoDataFrame of mode. Preferably after running ``fix_geometry``
+    outer_border_poly : Optional[Polygon], optional
+        Only include stops within this polygon. The default is None.
+    tolerance : Union[int, float], optional
+        From what distance should stops be snapped. The default is 10 (meters).
+    mode : Literal['tram', 'bus', 'rail'], optional
+        For which mode is this network. The default is 'bus'.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+
+    """
+    stops_geoms = get_stops_geoms(
+        osm=osm,
+        crs=net_gdf.crs,
+        outer_border_poly=outer_border_poly,
+        mode=mode
+    )
+    split_bys = defaultdict(set)
+    for i, row in net_gdf.iterrows():
+        dists = stops_geoms.distance(row.geometry)
+        dists = dists[dists < tolerance]
+        if len(dists) == 0:
+            continue
+        for idx in dists.index:
+            split_bys[i].add(idx)
+
+    split_gdf_rows = []
+    for i, row in net_gdf.iterrows():
+        if i in split_bys:
+            orig_geom = row.geometry
+            splitters = []
+            for idx in split_bys[i]:
+                proj_dist = orig_geom.project(stops_geoms.loc[idx, 'geometry'])
+                proj_stop = orig_geom.interpolate(proj_dist)
+                splitters.append(proj_stop)
+            geoms = split(orig_geom, unary_union(splitters))
+            for geom in list(geoms.geoms):
+                row_copy = row.copy()
+                row_copy['geometry'] = geom
+                split_gdf_rows.append(row_copy)
+        else:
+            split_gdf_rows.append(row)
+
+    split_gdf = gpd.GeoDataFrame(
+        split_gdf_rows,
+        crs=stops_geoms.crs
+    ).reset_index(drop=True)
+    return split_gdf
+
+
 def get_tram_net(
         osm: pyrosm.pyrosm.OSM,
         crs: str,
-        outer_border_poly: Optional[Polygon] = None
+        outer_border_poly: Optional[Polygon] = None,
+        split_at_stops: bool = True
 ) -> nx.MultiDiGraph:
     """
     Extract tram network from OSM and turn them into a cleaned directed graph.
@@ -273,8 +421,10 @@ def get_tram_net(
         OSM object of pyrosm module with a linked PBF file.
     crs: str
         Name of coordinate reference system.
-    outer_border_poly : Optional[gpd.GeoDataFrame], optional
+    outer_border_poly : Optional[Polygon], optional
         Polygon to crop net with. The default is None.
+    split_at_stops : Optional[bool], optional
+        Split links at the locations of tram stops. The default is True.
 
     Returns
     -------
@@ -289,6 +439,7 @@ def get_tram_net(
         keep_relations=False,
         extra_attributes=['maxspeed', 'railway', 'osmid']
     )
+
     if tram_net is None:
         logging.info('No tram links were found in the selection')
         return nx.MultiDiGraph()
@@ -304,6 +455,12 @@ def get_tram_net(
 
     tram_net = fix_geometry(tram_net)
     tags_to_dict(tram_net)
+
+    if split_at_stops:
+        tram_net = split_links_by_nearest_stops(
+            osm=osm, net_gdf=tram_net, mode='tram'
+        )
+
     tram_net['modes'] = 'tram'
     tram_net['lanes'] = 1
     tram_net['capacity'] = DEFAULT_TRAM_CAPACITY
@@ -342,7 +499,7 @@ def get_tram_net(
                     tram_net.loc[i, 'oneway'] = 'yes'
 
     graph = momepy.gdf_to_nx(tram_net, directed=True)
-    delete_islands_dir(graph)
+    delete_islands(graph)
     return graph
 
 
@@ -360,7 +517,7 @@ def get_metro_net(
         OSM object of pyrosm module with a linked PBF file.
     crs: str
         Name of coordinate reference system.
-    outer_border_poly : Optional[gpd.GeoDataFrame], optional
+    outer_border_poly : Optional[Polygon], optional
         Polygon to crop net with. The default is None.
 
     Returns
@@ -428,7 +585,7 @@ def get_metro_net(
                     metro_net.loc[i, 'oneway'] = 'yes'
 
     graph = momepy.gdf_to_nx(metro_net, directed=True)
-    delete_islands_dir(graph)
+    delete_islands(graph)
     return graph
 
 
@@ -454,7 +611,8 @@ def tags_to_dict(
 def get_rail_net(
         osm: pyrosm.pyrosm.OSM,
         crs: str,
-        outer_border_poly: Optional[Polygon] = None
+        outer_border_poly: Optional[Polygon] = None,
+        split_at_stops: bool = True
 ) -> nx.MultiDiGraph:
     """
     Extract railways from OSM ways and turn them into a cleaned directed graph.
@@ -467,8 +625,10 @@ def get_rail_net(
         OSM object of pyrosm module with a linked PBF file.
     crs: str
         Name of coordinate reference system.
-    outer_border_poly : Optional[gpd.GeoDataFrame], optional
+    outer_border_poly : Optional[Polygon], optional
         Polygon to crop net with. The default is None.
+    split_at_stops : Optional[bool], optional
+        Split links at the locations of rail platforms. The default is True.
 
     Returns
     -------
@@ -499,6 +659,16 @@ def get_rail_net(
     ]
     rail_net = fix_geometry(rail_net)
     tags_to_dict(rail_net)
+
+    if split_at_stops:
+        rail_net = split_links_by_nearest_stops(
+            osm=osm, 
+            outer_border_poly=outer_border_poly,
+            net_gdf=rail_net,
+            mode='rail',
+            tolerance=50
+        )
+
     rail_net['modes'] = 'rail'
     rail_net['capacity'] = DEFAULT_RAIL_CAPACITY
     rail_net['lanes'] = 1
@@ -517,7 +687,7 @@ def get_rail_net(
     ).reset_index(drop=True)
 
     graph = momepy.gdf_to_nx(rail_net, directed=True)
-    delete_islands_dir(graph)
+    delete_islands(graph)
     return graph
 
 
@@ -599,7 +769,7 @@ def deduce_bus_lanes(
     return bus_net
 
 
-def delete_islands_dir(
+def delete_islands(
         graph: nx.MultiDiGraph
 ):
     """
@@ -661,7 +831,7 @@ def guess_road_parameters(
     net.loc[net['lanes'] < 1, 'lanes'] = 1
     bus_net['modes'] = 'pt'
     bus_net['capacity'] = 360  # every 10 seconds
-    net['modes'] = 'car,pt'
+    net['modes'] = 'car,pt,bus'
     net['capacity'] = net.apply(guess_road_capacity, axis=1)
 
 
@@ -855,7 +1025,7 @@ def write_network(
             fr=fr,
             to=to,
             attrs=attrs,
-            add_attrs=('geometry','osm_id')
+            add_attrs=('geometry','id')
         )
 
     bigstring += '</links>\n'
@@ -1215,6 +1385,8 @@ def enumerate_edges(
 
     """
     to_skip = set()
+    possible_duplicates = []
+    maxi = start
     for i, e_key_data in enumerate(graph.edges(data=True, keys=True), start=start):
         fn, tn, ekey, edata = e_key_data
         if (fn, tn, ekey) in to_skip:
@@ -1226,7 +1398,23 @@ def enumerate_edges(
         for ofn, otn, oekey, oedata in oes:
             oedata[attr] = i
             to_skip.add((ofn, otn, oekey))
+            possible_duplicates.append((ofn, otn, i))
         edata[attr] = i
+        possible_duplicates.append((fn, tn, i))
+        maxi = i
+
+    maxi = maxi + 1
+    if len(set(possible_duplicates)) != len(possible_duplicates):
+        from collections import Counter
+        dups = [k for k, v in Counter(possible_duplicates).items() if v > 1]
+        for fn, tn, num in dups:
+            to_renum = [
+                ddata for dfn, dtn, dkey, ddata in graph.edges(data=True, keys=True)
+                if dfn == fn and dtn == tn and ddata[attr] == num
+            ][1:]
+            for renum in to_renum:
+                renum[attr] = maxi
+                maxi += 1
 
 
 def get_forbidden_uturns(
@@ -1448,7 +1636,14 @@ def get_restrictions(
     pd.DataFrame
 
     """
-    relations = pd.DataFrame(osm._relations[0])
+    if osm._relations is None:
+        raise RuntimeError(
+            'Relations in the OSM object are empty (parsing was not completed)'
+        )
+    elif isinstance(osm._relations, dict):
+        relations = pd.DataFrame(osm._relations)
+    else:
+        relations = pd.DataFrame(osm._relations[0])
     restrictions_types = relations['tags'].apply(
         lambda x: x['restriction']
         if 'type' in x and x['type'] == 'restriction' and 'restriction' in x
@@ -1606,7 +1801,7 @@ def get_lane_definitions(
         }
         idata = graph.edges[aie]
         fromlink = idata["link_id"]
-        fromlength = idata['mm_len']
+        fromlength = max(1, round(idata['mm_len'], 2))
         ld += f'{_ws(1)}<lanesToLinkAssignment linkIdRef="{fromlink}">\n'
         lanecount = int(idata['lanes'])
         base_capacity = round(idata["capacity"] / lanecount)
