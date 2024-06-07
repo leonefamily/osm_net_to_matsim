@@ -831,7 +831,7 @@ def guess_road_parameters(
     net.loc[net['lanes'] < 1, 'lanes'] = 1
     bus_net['modes'] = 'pt'
     bus_net['capacity'] = 360  # every 10 seconds
-    net['modes'] = 'car,pt,bus'
+    net['modes'] = 'car,truck,pt,bus'
     net['capacity'] = net.apply(guess_road_capacity, axis=1)
 
 
